@@ -555,6 +555,7 @@ Trusted mode skips user-key lookup and instead trusts explicit identity headers 
 - `/api/v1/admin/*` is special: when a configured `root_api_key` is presented, trusted mode treats the request as ROOT. Explicit account/user headers are allowed only when they are complete and match the target URL.
 - For ordinary trusted data APIs, role is determined by `X-OpenViking-Role` when present and authorized; otherwise by looking up the account/user in APIKeyManager. If the user exists, their configured role is used; otherwise it defaults to `USER`.
 - Trusted identity comes from the headers, not from a user key. If `root_api_key` is configured, it acts as proof that the caller is an approved trusted upstream.
+- To make a trusted data-plane identity eventually visible through the existing account/user management APIs, an upstream may explicitly add `X-OpenViking-Register-Identity: true`. Registration is asynchronous and batched (five minutes by default), creates no user API key, and never changes groups or an existing user's role. The header is ignored for `/api/v1/admin/*`; omitted or `false` preserves the normal non-registering behavior.
 - If `root_api_key` is also configured, every request must still provide a matching API key.
 - Only expose this mode behind a trusted network boundary or an identity-injecting gateway.
 

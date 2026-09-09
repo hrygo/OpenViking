@@ -1051,6 +1051,248 @@ async def test_trusted_mode_defaults_to_user_when_account_not_found(auth_app):
     assert identity.user_id == "some_user"
 
 
+async def test_trusted_identity_registration_header_batches_missing_identity(auth_service):
+    """Trusted data-plane opt-in queues registration and persists only on flush."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(
+        auth_mode="trusted",
+        trusted_identity_flush_interval_seconds=300,
+    )
+    app = FastAPI()
+    app.state.config = config
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        request = _make_request(
+            "/api/v1/resources",
+            headers={
+                "X-OpenViking-Account": "acme",
+                "X-OpenViking-User": "alice",
+                "X-OpenViking-Register-Identity": "true",
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        request.app.state.config = config
+        request.app.state.api_key_manager = app.state.api_key_manager
+
+        identity = await plugin.resolve_identity(
+            request,
+            x_openviking_account="acme",
+            x_openviking_user="alice",
+        )
+        assert identity.account_id == "acme"
+        assert identity.user_id == "alice"
+        assert plugin._api_key_manager.has_user("acme", "alice") is False
+
+        await plugin.flush_trusted_identities()
+
+        assert plugin._api_key_manager.get_users("acme", expose_key=True) == [
+            {"user_id": "alice", "role": "user", "identity_source": "trusted"}
+        ]
+    finally:
+        await plugin.shutdown()
+
+
+async def test_trusted_identity_registration_keeps_rootless_admin_api_disabled(auth_service):
+    """A private registry manager must not enable Admin APIs in rootless trusted mode."""
+    from openviking.server.auth import require_auth_root
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(auth_mode="trusted")
+    app = _build_auth_http_test_app(
+        identity=None, auth_enabled=False, auth_mode="trusted"
+    )
+    app.state.config = config
+
+    @app.get("/api/v1/admin/guarded")
+    @require_auth_root
+    async def guarded_admin(request: FastAPIRequest, ctx=Depends(get_request_context)):
+        return {"status": "ok"}
+
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        assert app.state.api_key_manager is None
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            admin_response = await client.get("/api/v1/admin/guarded")
+            assert admin_response.status_code == 403
+
+        request = _make_request(
+            "/api/v1/resources",
+            headers={
+                "X-OpenViking-Account": "acme",
+                "X-OpenViking-User": "alice",
+                "X-OpenViking-Register-Identity": "true",
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        request.app.state.config = config
+        await plugin.resolve_identity(
+            request, x_openviking_account="acme", x_openviking_user="alice"
+        )
+        await plugin.flush_trusted_identities()
+        assert plugin._api_key_manager.has_user("acme", "alice")
+    finally:
+        await plugin.shutdown()
+
+
+async def test_trusted_identity_registration_is_opt_in_and_excludes_admin_paths(auth_service):
+    """Missing/false headers and admin routes must never enqueue automatic registration."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(auth_mode="trusted")
+    app = FastAPI()
+    app.state.config = config
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        for path, register_header in (
+            ("/api/v1/resources", None),
+            ("/api/v1/resources", "false"),
+            ("/api/v1/admin/accounts", "true"),
+        ):
+            headers = {
+                "X-OpenViking-Account": "acme",
+                "X-OpenViking-User": "alice",
+            }
+            if register_header is not None:
+                headers["X-OpenViking-Register-Identity"] = register_header
+            request = _make_request(
+                path, headers=headers, auth_enabled=False, auth_mode="trusted"
+            )
+            request.app.state.config = config
+            request.app.state.api_key_manager = app.state.api_key_manager
+            await plugin.resolve_identity(
+                request,
+                x_openviking_account="acme",
+                x_openviking_user="alice",
+            )
+
+        await plugin.flush_trusted_identities()
+        assert plugin._api_key_manager.has_user("acme", "alice") is False
+    finally:
+        await plugin.shutdown()
+
+
+async def test_trusted_identity_registration_header_is_ignored_on_admin_paths(auth_service):
+    """Admin requests must not validate the data-plane registration header."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(auth_mode="trusted")
+    app = FastAPI()
+    app.state.config = config
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        request = _make_request(
+            "/api/v1/admin/accounts",
+            headers={
+                "X-OpenViking-Account": "acme",
+                "X-OpenViking-User": "alice",
+                "X-OpenViking-Register-Identity": "yes",
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        request.app.state.config = config
+        request.app.state.api_key_manager = app.state.api_key_manager
+
+        await plugin.resolve_identity(
+            request,
+            x_openviking_account="acme",
+            x_openviking_user="alice",
+        )
+
+        assert plugin._pending == {}
+    finally:
+        await plugin.shutdown()
+
+
+async def test_trusted_identity_registration_retries_failed_batch_without_exceeding_backlog(
+    auth_service, monkeypatch: pytest.MonkeyPatch
+):
+    """A failed flush returns its batch to the bounded queue for a later retry."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(
+        auth_mode="trusted",
+        trusted_identity_pending_max_size=2,
+        trusted_identity_known_max_size=1,
+    )
+    app = FastAPI()
+    app.state.config = config
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        plugin._queue_trusted_identity("acme", "alice")
+        plugin._queue_trusted_identity("acme", "bob")
+        plugin._queue_trusted_identity("acme", "eve")
+        assert plugin._pending == {"acme": {"alice", "bob"}}
+
+        original_ensure = plugin._api_key_manager.ensure_trusted_identities
+
+        async def _fail_once(identities):
+            monkeypatch.setattr(plugin._api_key_manager, "ensure_trusted_identities", original_ensure)
+            raise RuntimeError("temporary storage failure")
+
+        monkeypatch.setattr(plugin._api_key_manager, "ensure_trusted_identities", _fail_once)
+        await plugin.flush_trusted_identities()
+        assert plugin._pending == {"acme": {"alice", "bob"}}
+
+        await plugin.flush_trusted_identities()
+        assert plugin._api_key_manager.has_user("acme", "alice")
+        assert plugin._api_key_manager.has_user("acme", "bob")
+        assert len(plugin._known) == 1
+    finally:
+        await plugin.shutdown()
+
+
+async def test_trusted_identity_registration_rejects_invalid_opt_in_header(auth_service):
+    """The trusted opt-in header accepts only explicit true or false values."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(auth_mode="trusted")
+    app = FastAPI()
+    app.state.config = config
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        request = _make_request(
+            "/api/v1/resources",
+            headers={
+                "X-OpenViking-Account": "acme",
+                "X-OpenViking-User": "alice",
+                "X-OpenViking-Register-Identity": "yes",
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        request.app.state.config = config
+        request.app.state.api_key_manager = app.state.api_key_manager
+        with pytest.raises(InvalidArgumentError, match="Register-Identity"):
+            await plugin.resolve_identity(
+                request,
+                x_openviking_account="acme",
+                x_openviking_user="alice",
+            )
+    finally:
+        await plugin.shutdown()
+
+
+def test_trusted_identity_registration_config_limits_must_be_positive():
+    """Invalid trusted registration limits fail as normal server config validation."""
+    with pytest.raises(ValueError):
+        ServerConfig(trusted_identity_flush_interval_seconds=0)
+    with pytest.raises(ValueError):
+        ServerConfig(trusted_identity_pending_max_size=0)
+    with pytest.raises(ValueError):
+        ServerConfig(trusted_identity_known_max_size=0)
+
+
 async def test_trusted_mode_with_root_api_key_requires_matching_api_key():
     """Trusted mode should require the configured server API key when present."""
     request = _make_request(

@@ -353,6 +353,10 @@ class ServerConfig(BaseModel):
     api_key_watch_enabled: bool = False
     # Poll interval; each check only stats registry files and reads fully on change.
     api_key_watch_interval_seconds: float = 30.0
+    # Trusted-mode identity registration is request-opt-in and batched in memory.
+    trusted_identity_flush_interval_seconds: float = Field(300.0, gt=0)
+    trusted_identity_pending_max_size: int = Field(10_000, gt=0)
+    trusted_identity_known_max_size: int = Field(100_000, gt=0)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     usage_reporter: UsageReporterConfig = Field(default_factory=UsageReporterConfig)
     # Public-facing base URL emitted in MCP-issued upload instructions. See
