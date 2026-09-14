@@ -4,6 +4,7 @@ import {
   extractCaptureTurns,
   extractPartsFromPayload,
   filterCaptureParts,
+  finalAssistantKeepMask,
   shouldCaptureText,
 } from "./lib/capture-utils.mjs"
 
@@ -257,4 +258,25 @@ test("both capture scope knobs combine", () => {
     ["user", "please fix the failing test"],
     ["assistant", "the fix is in the parser"],
   ])
+})
+
+test("finalAssistantKeepMask keeps the last assistant entry of each user turn", () => {
+  const entries = [
+    { role: "user" },
+    { role: "assistant" },
+    { role: "assistant" },
+    { role: "user" },
+    { role: "assistant" },
+  ]
+  assert.deepEqual(finalAssistantKeepMask(entries), [true, false, true, true, true])
+})
+
+test("finalAssistantKeepMask does not let a tool result open a group", () => {
+  const entries = [
+    { role: "user" },
+    { role: "assistant" },
+    { role: "user", isToolTransport: true },
+    { role: "assistant" },
+  ]
+  assert.deepEqual(finalAssistantKeepMask(entries), [true, false, true, true])
 })

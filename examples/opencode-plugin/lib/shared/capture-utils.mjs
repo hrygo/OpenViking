@@ -415,36 +415,45 @@ export function filterCaptureParts(parts, role, cfg = {}) {
 }
 
 /**
- * Apply the capture-scope knobs to the turns collected from a rollout.
+ * Which entries survive `captureAssistantFinalOnly`, as a mask over the input
+ * order. A group opens on a non-transport `user` entry; inside a group every
+ * non-assistant entry survives and only the last assistant entry does.
  *
- * `captureAssistantFinalOnly` keeps one assistant answer per user turn — the last
- * one — so a reply the model rewrote a few times is captured once, in its final
- * shape. Tool transport entries normalize to `user`, so only an entry that is not
- * tool transport may open a new group; otherwise every tool result would split the
- * turn in two.
+ * A tool result normalizes to the `user` role in a rollout, so only an entry that
+ * is not tool transport may open a group; otherwise every tool result would split
+ * one turn in two. Shared by the harnesses that assemble their own turn list — they
+ * hand over `{ role, isToolTransport }` descriptors and drop the masked-out
+ * entries.
  */
-function applyCaptureScope(collected, cfg) {
-  if (cfg.captureAssistantFinalOnly !== true) return collected.map((entry) => entry.turn);
-
-  const out = [];
+export function finalAssistantKeepMask(entries) {
+  const keep = new Array(entries.length).fill(true);
   let group = [];
   const flush = () => {
     if (!group.length) return;
-    let lastAssistant = null;
-    for (const entry of group) {
-      if (entry.turn.role === "assistant") lastAssistant = entry;
+    let last = -1;
+    for (const i of group) {
+      if (entries[i].role === "assistant") last = i;
     }
-    for (const entry of group) {
-      if (entry.turn.role !== "assistant" || entry === lastAssistant) out.push(entry.turn);
+    for (const i of group) {
+      if (entries[i].role === "assistant" && i !== last) keep[i] = false;
     }
     group = [];
   };
-  for (const entry of collected) {
-    if (entry.turn.role === "user" && !entry.isToolTransport) flush();
-    group.push(entry);
-  }
+  entries.forEach((entry, i) => {
+    if (entry.role === "user" && !entry.isToolTransport) flush();
+    group.push(i);
+  });
   flush();
-  return out;
+  return keep;
+}
+
+function applyCaptureScope(collected, cfg) {
+  if (cfg.captureAssistantFinalOnly !== true) return collected.map((entry) => entry.turn);
+  const keep = finalAssistantKeepMask(collected.map((entry) => ({
+    role: entry.turn.role,
+    isToolTransport: entry.isToolTransport,
+  })));
+  return collected.filter((_, i) => keep[i]).map((entry) => entry.turn);
 }
 
 /**
